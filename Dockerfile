@@ -5,6 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci
 COPY . .
+RUN mkdir -p public
 RUN npm run build
 
 # ── Production stage ──
@@ -17,7 +18,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # Copy built app
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
-COPY --from=builder /app/public ./public 2>/dev/null || true
+COPY --from=builder /app/public ./public
 
 # Create tmp directory for video generation
 RUN mkdir -p /app/tmp && chmod 777 /app/tmp
