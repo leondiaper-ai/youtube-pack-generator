@@ -1,14 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: "standalone",
   experimental: {
     serverActions: {
       bodySizeLimit: "100mb",
-    },
-  },
-  // Allow large API request bodies (for audio uploads)
-  api: {
-    bodyParser: {
-      sizeLimit: "100mb",
     },
   },
 };
