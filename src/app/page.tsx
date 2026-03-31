@@ -107,7 +107,7 @@ export default function Home() {
     };
   };
 
-  /* ── Main generate (thumbnail + metadata — instant) ── */
+  /* ── Main generate — kicks off everything ── */
   const handleGenerate = async () => {
     setLoading(true);
     setGenerated(false);
@@ -118,6 +118,7 @@ export default function Home() {
     setShorts([]); setShortsStatus("idle"); setShortsError(null);
 
     try {
+      // 1. Thumbnail (instant, client-side)
       if (artworkPreview) {
         const thumb = await generateThumbnail({
           artworkDataUrl: artworkPreview,
@@ -128,6 +129,7 @@ export default function Home() {
         setThumbnailUrl(thumb);
       }
 
+      // 2. Metadata (instant, client-side)
       const meta = generateMetadata({
         artistName: form.artistName,
         trackTitle: form.trackTitle,
@@ -141,6 +143,16 @@ export default function Home() {
       console.error("Generation error:", err);
     } finally {
       setLoading(false);
+    }
+
+    // 3. Fire off video generation in parallel (these run server-side via FFmpeg)
+    const hasArtworkAndAudio = !!(form.artworkFile && form.audioFile);
+    if (hasArtworkAndAudio) {
+      handleVisualiser();
+      if (form.lyrics.trim()) {
+        handleLyricVideo();
+      }
+      handleShorts();
     }
   };
 
@@ -318,8 +330,13 @@ export default function Home() {
 
       {/* Generate Button */}
       <button onClick={handleGenerate} disabled={loading} className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed py-3 text-sm font-semibold text-white transition">
-        {loading ? <Spinner text="Generating..." /> : "Generate YouTube Pack"}
+        {loading ? <Spinner text="Generating..." /> : "Generate Full YouTube Pack"}
       </button>
+      {hasMedia && (
+        <p className="text-xs text-gray-500 text-center mt-2">
+          Generates thumbnail, metadata, visualiser{form.lyrics.trim() ? ", lyric video" : ""}, and 3 shorts
+        </p>
+      )}
 
       {/* ── Output Section ── */}
       {generated && (

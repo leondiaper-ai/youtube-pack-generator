@@ -50,7 +50,7 @@ function buildShortFilter(
       // Slow drift, minimal text at bottom
       return [
         `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,`,
-        `zoompan=z='1.0+0.04*abs(sin(on/${Math.max(Math.round(totalFrames / 3), 1)}*PI))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1080:1920:fps=${fps},`,
+        `zoompan=z='1.0+0.04*abs(sin(on/${Math.max(Math.round(totalFrames / 3), 1)}*PI))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1080x1920:fps=${fps},`,
         `eq=saturation=0.85:brightness=-0.02,`,
         `vignette=PI/4,`,
         `noise=alls=5:allf=t,`,
@@ -64,7 +64,7 @@ function buildShortFilter(
       // Lyric line centered with fade, artwork bg dimmed
       return [
         `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,`,
-        `zoompan=z='min(zoom+0.0002,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1080:1920:fps=${fps},`,
+        `zoompan=z='min(zoom+0.0002,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=1080x1920:fps=${fps},`,
         `eq=saturation=0.7:brightness=-0.08,`,
         `drawbox=x=0:y=0:w=1080:h=1920:color=black@0.5:t=fill,`,
         // Lyric text with glow
