@@ -1,13 +1,24 @@
 "use client";
 
 import { useState } from "react";
-import { generateThumbnail } from "@/lib/thumbnail";
-import { generateMetadata, type MetadataOutput, type ArtistProfile } from "@/lib/metadata";
+import {
+  generateThumbnail,
+  type StylePreset,
+  type ThumbnailTextMode,
+} from "@/lib/thumbnail";
+import {
+  generateMetadata,
+  type MetadataOutput,
+  type ArtistProfile,
+} from "@/lib/metadata";
 
-type StylePreset = "Clean" | "Bold" | "Moody";
-type VisPreset = "moody-drift" | "pulse" | "parallax";
-type LyricStyle = "fade" | "highlight" | "reveal";
-type LyricLayout = "center" | "lower-third" | "fullscreen";
+/* ─────────────────────────────────────────────────────────────
+   Types — kept in sync with the server routes in
+   src/app/api/{visualiser,lyric-video,shorts}/route.ts
+   ───────────────────────────────────────────────────────────── */
+type VisPreset = "clean-minimal" | "moody-drift" | "bold-pulse";
+type LyricTransition = "fade" | "slide" | "cut";
+type LyricLayout = "centered" | "lower-third";
 type JobStatus = "idle" | "generating" | "done" | "error";
 
 interface FormData {
@@ -17,9 +28,11 @@ interface FormData {
   lyrics: string;
   artworkFile: File | null;
   stylePreset: StylePreset;
+  thumbnailTextMode: ThumbnailTextMode;
   visPreset: VisPreset;
-  lyricStyle: LyricStyle;
+  lyricTransition: LyricTransition;
   lyricLayout: LyricLayout;
+  shortsLockup: boolean;
   genre: string;
   tone: string;
   spotifyUrl: string;
@@ -27,15 +40,17 @@ interface FormData {
   instagramUrl: string;
 }
 
-interface ShortResult {
-  url: string;
-  type: "hook" | "loop" | "lyric";
-  title: string;
-  caption: string;
+interface ShortItem {
+  index: number;
+  hook: string;
+  status: "ok" | "error";
+  detail?: string;
+  url?: string;
 }
 
-/* ───────────────────────────────────────────── */
-
+/* ─────────────────────────────────────────────────────────────
+   Home
+   ───────────────────────────────────────────────────────────── */
 export default function Home() {
   const [form, setForm] = useState<FormData>({
     artistName: "",
@@ -44,9 +59,11 @@ export default function Home() {
     lyrics: "",
     artworkFile: null,
     stylePreset: "Clean",
-    visPreset: "moody-drift",
-    lyricStyle: "fade",
-    lyricLayout: "center",
+    thumbnailTextMode: "none",
+    visPreset: "clean-minimal",
+    lyricTransition: "fade",
+    lyricLayout: "centered",
+    shortsLockup: true,
     genre: "",
     tone: "",
     spotifyUrl: "",
@@ -65,14 +82,17 @@ export default function Home() {
   const [visStatus, setVisStatus] = useState<JobStatus>("idle");
   const [visUrl, setVisUrl] = useState<string | null>(null);
   const [visError, setVisError] = useState<string | null>(null);
+  const [visLogs, setVisLogs] = useState<string[]>([]);
 
   const [lyricStatus, setLyricStatus] = useState<JobStatus>("idle");
   const [lyricUrl, setLyricUrl] = useState<string | null>(null);
   const [lyricError, setLyricError] = useState<string | null>(null);
+  const [lyricLogs, setLyricLogs] = useState<string[]>([]);
 
-  const [shorts, setShorts] = useState<ShortResult[]>([]);
+  const [shorts, setShorts] = useState<ShortItem[]>([]);
   const [shortsStatus, setShortsStatus] = useState<JobStatus>("idle");
   const [shortsError, setShortsError] = useState<string | null>(null);
+  const [shortsLogs, setShortsLogs] = useState<string[]>([]);
 
   const [showProfile, setShowProfile] = useState(false);
 
@@ -91,7 +111,6 @@ export default function Home() {
     }
   };
 
-  /* ── Build artist profile from form ── */
   const buildProfile = (): ArtistProfile | undefined => {
     if (!form.genre && !form.tone && !form.spotifyUrl) return undefined;
     return {
@@ -107,15 +126,15 @@ export default function Home() {
     };
   };
 
-  /* ── Main generate — kicks off everything ── */
+  /* ── Main generate ───────────────────────────────────── */
   const handleGenerate = async () => {
     setLoading(true);
     setGenerated(false);
     setThumbnailUrl(null);
     setMetadata(null);
-    setVisStatus("idle"); setVisUrl(null); setVisError(null);
-    setLyricStatus("idle"); setLyricUrl(null); setLyricError(null);
-    setShorts([]); setShortsStatus("idle"); setShortsError(null);
+    setVisStatus("idle"); setVisUrl(null); setVisError(null); setVisLogs([]);
+    setLyricStatus("idle"); setLyricUrl(null); setLyricError(null); setLyricLogs([]);
+    setShorts([]); setShortsStatus("idle"); setShortsError(null); setShortsLogs([]);
 
     try {
       // 1. Thumbnail (instant, client-side)
@@ -125,6 +144,7 @@ export default function Home() {
           artistName: form.artistName,
           trackTitle: form.trackTitle,
           style: form.stylePreset,
+          textMode: form.thumbnailTextMode,
         });
         setThumbnailUrl(thumb);
       }
@@ -145,7 +165,7 @@ export default function Home() {
       setLoading(false);
     }
 
-    // 3. Fire off video generation in parallel (these run server-side via FFmpeg)
+    // 3. Kick off video generation in parallel
     const hasArtworkAndAudio = !!(form.artworkFile && form.audioFile);
     if (hasArtworkAndAudio) {
       handleVisualiser();
@@ -156,17 +176,24 @@ export default function Home() {
     }
   };
 
-  /* ── Visualiser ── */
+  /* ── Visualiser ──────────────────────────────────────── */
   const handleVisualiser = async () => {
     if (!form.artworkFile || !form.audioFile) return;
-    setVisStatus("generating"); setVisError(null); setVisUrl(null);
+    setVisStatus("generating"); setVisError(null); setVisUrl(null); setVisLogs([]);
     try {
       const fd = new window.FormData();
       fd.append("artwork", form.artworkFile);
       fd.append("audio", form.audioFile);
       fd.append("preset", form.visPreset);
       const res = await fetch("/api/visualiser", { method: "POST", body: fd });
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Error ${res.status}`);
+      // structured logs come via X-YPG-Logs header on success, or JSON body on error
+      const headerLogs = res.headers.get("X-YPG-Logs");
+      if (headerLogs) setVisLogs(decodeURIComponent(headerLogs).split(" | "));
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (Array.isArray(body.logs)) setVisLogs(body.logs);
+        throw new Error(body.error || body.detail || `Error ${res.status}`);
+      }
       setVisUrl(URL.createObjectURL(await res.blob()));
       setVisStatus("done");
     } catch (err) {
@@ -175,20 +202,25 @@ export default function Home() {
     }
   };
 
-  /* ── Lyric Video ── */
+  /* ── Lyric Video ─────────────────────────────────────── */
   const handleLyricVideo = async () => {
     if (!form.artworkFile || !form.audioFile || !form.lyrics.trim()) return;
-    setLyricStatus("generating"); setLyricError(null); setLyricUrl(null);
+    setLyricStatus("generating"); setLyricError(null); setLyricUrl(null); setLyricLogs([]);
     try {
       const fd = new window.FormData();
       fd.append("artwork", form.artworkFile);
       fd.append("audio", form.audioFile);
       fd.append("lyrics", form.lyrics);
-      fd.append("style", form.lyricStyle);
       fd.append("layout", form.lyricLayout);
-      fd.append("textColor", "#FFFFFF");
+      fd.append("transition", form.lyricTransition);
       const res = await fetch("/api/lyric-video", { method: "POST", body: fd });
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Error ${res.status}`);
+      const headerLogs = res.headers.get("X-YPG-Logs");
+      if (headerLogs) setLyricLogs(decodeURIComponent(headerLogs).split(" | "));
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (Array.isArray(body.logs)) setLyricLogs(body.logs);
+        throw new Error(body.error || body.detail || `Error ${res.status}`);
+      }
       setLyricUrl(URL.createObjectURL(await res.blob()));
       setLyricStatus("done");
     } catch (err) {
@@ -197,58 +229,55 @@ export default function Home() {
     }
   };
 
-  /* ── Shorts (all 3) ── */
+  /* ── Shorts (single API call, returns 3) ─────────────── */
   const handleShorts = async () => {
     if (!form.artworkFile || !form.audioFile) return;
-    setShortsStatus("generating"); setShortsError(null); setShorts([]);
-
-    // Pick a hook lyric line and a standalone lyric line
-    const lyricLines = (form.lyrics || "").split("\n").map(l => l.trim()).filter(l => l.length > 5);
-    const hookText = lyricLines.length > 0
-      ? lyricLines[Math.min(2, lyricLines.length - 1)]
-      : form.trackTitle;
-    const lyricText = lyricLines.length > 3
-      ? lyricLines[Math.floor(lyricLines.length * 0.4)]
-      : hookText;
-
-    const shortDefs: { type: "hook" | "loop" | "lyric"; text: string; title: string; caption: string }[] = [
-      { type: "hook", text: hookText, title: `${form.trackTitle} — Hook`, caption: `"${hookText}" — ${form.artistName}` },
-      { type: "loop", text: "", title: `${form.trackTitle} — Visual Loop`, caption: `${form.artistName} — ${form.trackTitle}` },
-      { type: "lyric", text: lyricText, title: `${form.trackTitle} — Lyric`, caption: `"${lyricText}" — ${form.artistName}` },
-    ];
-
+    setShortsStatus("generating"); setShortsError(null); setShorts([]); setShortsLogs([]);
     try {
-      const results: ShortResult[] = [];
-      for (const def of shortDefs) {
-        const fd = new window.FormData();
-        fd.append("artwork", form.artworkFile!);
-        fd.append("audio", form.audioFile!);
-        fd.append("type", def.type);
-        fd.append("text", def.text);
-        fd.append("artistName", form.artistName || "Artist");
-        const res = await fetch("/api/shorts", { method: "POST", body: fd });
-        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `Error ${res.status}`);
-        results.push({
-          url: URL.createObjectURL(await res.blob()),
-          type: def.type,
-          title: def.title,
-          caption: def.caption,
-        });
+      const fd = new window.FormData();
+      fd.append("artwork", form.artworkFile);
+      fd.append("audio", form.audioFile);
+      fd.append("lyrics", form.lyrics || "");
+      fd.append("artist", form.artistName || "");
+      fd.append("title", form.trackTitle || "");
+      fd.append("showLockup", String(form.shortsLockup));
+      const res = await fetch("/api/shorts", { method: "POST", body: fd });
+      const body = await res.json().catch(() => ({}));
+      if (Array.isArray(body.logs)) setShortsLogs(body.logs);
+      if (!res.ok && !body.ok) {
+        throw new Error(body.error || body.detail || `Error ${res.status}`);
       }
-      setShorts(results);
-      setShortsStatus("done");
+      const rawShorts: Array<{ index: number; hook: string; status: "ok" | "error"; detail?: string; data?: string }> = body.shorts || [];
+      const items: ShortItem[] = rawShorts.map((s) => {
+        if (s.status === "ok" && s.data) {
+          const bin = Uint8Array.from(atob(s.data), (c) => c.charCodeAt(0));
+          const blob = new Blob([bin], { type: "video/mp4" });
+          return { index: s.index, hook: s.hook, status: "ok", url: URL.createObjectURL(blob) };
+        }
+        return { index: s.index, hook: s.hook, status: "error", detail: s.detail };
+      });
+      setShorts(items);
+      // Partial-success: as long as at least one short rendered, mark "done".
+      // ErrorBlocks still show for any that failed.
+      const anyOk = items.some((s) => s.status === "ok");
+      if (anyOk) {
+        setShortsStatus("done");
+      } else {
+        throw new Error("All 3 shorts failed to render");
+      }
     } catch (err) {
       setShortsError(err instanceof Error ? err.message : "Unknown error");
       setShortsStatus("error");
     }
   };
 
-  /* ── Completeness ── */
+  /* ── Completeness ────────────────────────────────────── */
+  const okShortsCount = shorts.filter((s) => s.status === "ok").length;
   const completeness = {
     thumbnail: !!thumbnailUrl,
     visualiser: visStatus === "done",
     lyricVideo: lyricStatus === "done",
-    shorts: shorts.length,
+    shorts: okShortsCount,
     metadata: !!metadata,
   };
   const totalDone = [
@@ -260,7 +289,7 @@ export default function Home() {
   ].filter(Boolean).length;
 
   const inputClass =
-    "w-full rounded-lg bg-gray-800 border border-gray-700 px-4 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition";
+    "w-full rounded-lg bg-gray-800 border border-gray-700 px-4 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:border-indigo-500 focus:outline-none transition";
 
   const hasMedia = !!(form.artworkFile && form.audioFile);
 
@@ -285,7 +314,7 @@ export default function Home() {
 
         <div>
           <label className="block text-xs font-medium text-gray-400 mb-1.5">Audio File</label>
-          <input type="file" accept="audio/*" className={inputClass + " file:mr-3 file:rounded file:border-0 file:bg-indigo-600 file:px-3 file:py-1 file:text-xs file:text-white file:cursor-pointer"} onChange={(e) => update("audioFile", e.target.files?.[0] ?? null)} />
+          <input type="file" accept="audio/*" className={inputClass + " file:mr-3 file:rounded file:border-0 file:bg-indigo-600 file:text-white file:px-3 file:py-1.5 file:text-xs"} onChange={(e) => update("audioFile", e.target.files?.[0] || null)} />
         </div>
 
         <div>
@@ -294,19 +323,72 @@ export default function Home() {
         </div>
 
         <div>
-          <label className="block text-xs font-medium text-gray-400 mb-1.5">Artwork or Source Video</label>
-          <input type="file" accept="image/*,video/*" className={inputClass + " file:mr-3 file:rounded file:border-0 file:bg-indigo-600 file:px-3 file:py-1 file:text-xs file:text-white file:cursor-pointer"} onChange={(e) => handleArtworkChange(e.target.files?.[0] ?? null)} />
+          <label className="block text-xs font-medium text-gray-400 mb-1.5">Artwork (PNG/JPG)</label>
+          <input type="file" accept="image/*" className={inputClass + " file:mr-3 file:rounded file:border-0 file:bg-indigo-600 file:text-white file:px-3 file:py-1.5 file:text-xs"} onChange={(e) => handleArtworkChange(e.target.files?.[0] || null)} />
         </div>
 
         {/* Preset selectors */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <SelectField label="Style Preset" value={form.stylePreset} onChange={(v) => update("stylePreset", v as StylePreset)} options={[["Clean", "Clean"], ["Bold", "Bold"], ["Moody", "Moody"]]} />
-          <SelectField label="Visualiser Preset" value={form.visPreset} onChange={(v) => update("visPreset", v as VisPreset)} options={[["moody-drift", "Moody Drift"], ["pulse", "Pulse"], ["parallax", "Parallax"]]} />
+          <SelectField
+            label="Thumbnail Style"
+            value={form.stylePreset}
+            onChange={(v) => update("stylePreset", v as StylePreset)}
+            options={[["Clean", "Clean"], ["Bold", "Bold"], ["Moody", "Moody"]]}
+          />
+          <SelectField
+            label="Thumbnail Text"
+            value={form.thumbnailTextMode}
+            onChange={(v) => update("thumbnailTextMode", v as ThumbnailTextMode)}
+            options={[
+              ["none", "No Text"],
+              ["title-only", "Title Only"],
+              ["artist-title", "Artist + Title"],
+            ]}
+          />
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <SelectField label="Lyric Style" value={form.lyricStyle} onChange={(v) => update("lyricStyle", v as LyricStyle)} options={[["fade", "Fade In/Out"], ["highlight", "Highlight Line"], ["reveal", "Word Reveal"]]} />
-          <SelectField label="Lyric Layout" value={form.lyricLayout} onChange={(v) => update("lyricLayout", v as LyricLayout)} options={[["center", "Centered"], ["lower-third", "Lower Third"], ["fullscreen", "Fullscreen"]]} />
+          <SelectField
+            label="Visualiser Preset"
+            value={form.visPreset}
+            onChange={(v) => update("visPreset", v as VisPreset)}
+            options={[
+              ["clean-minimal", "Clean Minimal"],
+              ["moody-drift", "Moody Drift"],
+              ["bold-pulse", "Bold Pulse"],
+            ]}
+          />
+          <SelectField
+            label="Shorts Lockup"
+            value={form.shortsLockup ? "on" : "off"}
+            onChange={(v) => update("shortsLockup", v === "on")}
+            options={[
+              ["on", "Show Artist + Title on first short"],
+              ["off", "No lockup"],
+            ]}
+          />
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <SelectField
+            label="Lyric Layout"
+            value={form.lyricLayout}
+            onChange={(v) => update("lyricLayout", v as LyricLayout)}
+            options={[
+              ["centered", "Centered"],
+              ["lower-third", "Lower Third"],
+            ]}
+          />
+          <SelectField
+            label="Lyric Transition"
+            value={form.lyricTransition}
+            onChange={(v) => update("lyricTransition", v as LyricTransition)}
+            options={[
+              ["fade", "Fade"],
+              ["slide", "Slide Up"],
+              ["cut", "Cut"],
+            ]}
+          />
         </div>
 
         {/* Artist Profile (collapsible) */}
@@ -318,7 +400,18 @@ export default function Home() {
             <div className="mt-3 space-y-3 rounded-lg bg-gray-800/50 border border-gray-700 p-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <InputField label="Genre" placeholder="e.g. R&B, Hip-Hop" value={form.genre} onChange={(v) => update("genre", v)} />
-                <SelectField label="Tone" value={form.tone} onChange={(v) => update("tone", v)} options={[["", "Auto (from style)"], ["moody", "Moody"], ["energetic", "Energetic"], ["minimal", "Minimal"], ["bold", "Bold"]]} />
+                <SelectField
+                  label="Tone"
+                  value={form.tone}
+                  onChange={(v) => update("tone", v)}
+                  options={[
+                    ["", "Auto"],
+                    ["chill", "Chill"],
+                    ["energetic", "Energetic"],
+                    ["moody", "Moody"],
+                    ["uplifting", "Uplifting"],
+                  ]}
+                />
               </div>
               <InputField label="Spotify URL" placeholder="https://open.spotify.com/..." value={form.spotifyUrl} onChange={(v) => update("spotifyUrl", v)} />
               <InputField label="Apple Music URL" placeholder="https://music.apple.com/..." value={form.appleUrl} onChange={(v) => update("appleUrl", v)} />
@@ -329,7 +422,7 @@ export default function Home() {
       </section>
 
       {/* Generate Button */}
-      <button onClick={handleGenerate} disabled={loading} className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed py-3 text-sm font-semibold text-white transition">
+      <button onClick={handleGenerate} disabled={loading} className="w-full rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium py-3 transition">
         {loading ? <Spinner text="Generating..." /> : "Generate Full YouTube Pack"}
       </button>
       {hasMedia && (
@@ -356,7 +449,7 @@ export default function Home() {
             </div>
           </div>
 
-          {/* ── Thumbnail ── */}
+          {/* Thumbnail */}
           <OutputSection title="Thumbnail">
             {thumbnailUrl ? (
               <div className="space-y-2">
@@ -368,12 +461,13 @@ export default function Home() {
             )}
           </OutputSection>
 
-          {/* ── Visualiser ── */}
+          {/* Visualiser */}
           <OutputSection title="Visualiser">
             <VideoJobOutput
               status={visStatus}
               url={visUrl}
               error={visError}
+              logs={visLogs}
               filename={`${form.artistName}-${form.trackTitle}-visualiser.mp4`}
               onGenerate={handleVisualiser}
               onRetry={handleVisualiser}
@@ -384,12 +478,13 @@ export default function Home() {
             />
           </OutputSection>
 
-          {/* ── Lyric Video ── */}
+          {/* Lyric Video */}
           <OutputSection title="Lyric Video">
             <VideoJobOutput
               status={lyricStatus}
               url={lyricUrl}
               error={lyricError}
+              logs={lyricLogs}
               filename={`${form.artistName}-${form.trackTitle}-lyric-video.mp4`}
               onGenerate={handleLyricVideo}
               onRetry={handleLyricVideo}
@@ -400,52 +495,31 @@ export default function Home() {
             />
           </OutputSection>
 
-          {/* ── Shorts ── */}
+          {/* Shorts */}
           <OutputSection title="Shorts">
-            {shortsStatus === "done" && shorts.length > 0 ? (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                {shorts.map((s) => (
-                  <div key={s.type} className="space-y-2">
-                    <video src={s.url} controls className="rounded-lg border border-gray-700 w-full aspect-[9/16] object-cover" />
-                    <p className="text-xs text-gray-300 font-medium">{s.title}</p>
-                    <p className="text-xs text-gray-500">{s.caption}</p>
-                    <DownloadBtn href={s.url} filename={`${form.artistName}-short-${s.type}.mp4`} label="Download" />
-                  </div>
-                ))}
-              </div>
-            ) : shortsStatus === "generating" ? (
-              <div className="rounded-lg bg-gray-800 border border-gray-700 p-8 flex items-center justify-center">
-                <Spinner text="Generating 3 Shorts... this takes a moment" />
-              </div>
-            ) : shortsStatus === "error" ? (
-              <ErrorBlock message={shortsError} onRetry={handleShorts} />
-            ) : hasMedia ? (
-              <div className="space-y-2">
-                <Placeholder label="3 Shorts ready to generate: Hook, Loop, Lyric" />
-                <button onClick={handleShorts} className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded transition">
-                  Generate All Shorts
-                </button>
-              </div>
-            ) : (
-              <Placeholder label="Upload artwork + audio to enable" />
-            )}
+            <ShortsOutput
+              status={shortsStatus}
+              shorts={shorts}
+              error={shortsError}
+              logs={shortsLogs}
+              onRetry={handleShorts}
+              hasMedia={hasMedia}
+              artistName={form.artistName}
+            />
           </OutputSection>
 
-          {/* ── Metadata Copy ── */}
+          {/* Metadata Copy */}
           {metadata && (
             <>
               <OutputSection title="Visualiser Copy">
                 <CopyOptions data={metadata.visualiser} />
               </OutputSection>
-
               <OutputSection title="Lyric Video Copy">
                 <CopyOptions data={metadata.lyricVideo} />
               </OutputSection>
-
               <OutputSection title="Shorts Copy">
                 <CopyOptions data={metadata.shorts} />
               </OutputSection>
-
               <OutputSection title="Extras">
                 <CopyBlock label="Pinned Comment" text={metadata.pinnedComment} />
                 <CopyBlock label="Community Post" text={metadata.communityPost} />
@@ -458,15 +532,15 @@ export default function Home() {
   );
 }
 
-/* ══════════════════════════════════════════════
+/* ─────────────────────────────────────────────────────────────
    Helper Components
-   ══════════════════════════════════════════════ */
+   ───────────────────────────────────────────────────────────── */
 
 function InputField({ label, placeholder, value, onChange }: { label: string; placeholder: string; value: string; onChange: (v: string) => void }) {
   return (
     <div>
       <label className="block text-xs font-medium text-gray-400 mb-1.5">{label}</label>
-      <input type="text" placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-lg bg-gray-800 border border-gray-700 px-4 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition" />
+      <input type="text" placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-lg bg-gray-800 border border-gray-700 px-4 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:border-indigo-500 focus:outline-none transition" />
     </div>
   );
 }
@@ -475,7 +549,7 @@ function SelectField({ label, value, onChange, options }: { label: string; value
   return (
     <div>
       <label className="block text-xs font-medium text-gray-400 mb-1.5">{label}</label>
-      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-lg bg-gray-800 border border-gray-700 px-4 py-2.5 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition">
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="w-full rounded-lg bg-gray-800 border border-gray-700 px-4 py-2.5 text-sm text-gray-100 focus:border-indigo-500 focus:outline-none transition">
         {options.map(([val, lbl]) => <option key={val} value={val}>{lbl}</option>)}
       </select>
     </div>
@@ -493,8 +567,8 @@ function OutputSection({ title, children }: { title: string; children: React.Rea
 
 function StatusBadge({ label, done }: { label: string; done: boolean }) {
   return (
-    <span className={`text-xs px-2.5 py-1 rounded-full border ${done ? "border-green-700 bg-green-900/30 text-green-400" : "border-gray-600 bg-gray-800 text-gray-500"}`}>
-      {done ? "\u2713" : "\u25CB"} {label}
+    <span className={`text-xs px-2.5 py-1 rounded-full border ${done ? "border-green-700 bg-green-900/30 text-green-300" : "border-gray-700 bg-gray-800 text-gray-400"}`}>
+      {done ? "✓" : "○"} {label}
     </span>
   );
 }
@@ -521,17 +595,34 @@ function Placeholder({ label }: { label: string }) {
 
 function DownloadBtn({ href, filename, label }: { href: string; filename: string; label: string }) {
   return (
-    <a href={href} download={filename} className="inline-block text-xs bg-gray-800 hover:bg-gray-700 text-indigo-400 px-3 py-1.5 rounded transition">
+    <a href={href} download={filename} className="inline-block text-xs bg-gray-800 hover:bg-gray-700 text-indigo-400 border border-gray-700 px-3 py-1.5 rounded transition">
       {label}
     </a>
   );
 }
 
-function ErrorBlock({ message, onRetry }: { message: string | null; onRetry: () => void }) {
+function ErrorBlock({ message, logs, onRetry }: { message: string | null; logs?: string[]; onRetry: () => void }) {
+  const [showLogs, setShowLogs] = useState(false);
   return (
     <div className="space-y-2">
-      <div className="rounded-lg bg-red-900/30 border border-red-800 p-3 text-xs text-red-300">{message}</div>
-      <button onClick={onRetry} className="text-xs bg-gray-800 hover:bg-gray-700 text-indigo-400 px-3 py-1.5 rounded transition">Retry</button>
+      <div className="rounded-lg bg-red-900/30 border border-red-800 p-3 text-xs text-red-300">
+        {message || "Unknown error"}
+      </div>
+      {logs && logs.length > 0 && (
+        <div>
+          <button onClick={() => setShowLogs((v) => !v)} className="text-xs text-gray-400 hover:text-gray-300 transition">
+            {showLogs ? "Hide logs" : "Show logs"}
+          </button>
+          {showLogs && (
+            <pre className="mt-2 max-h-64 overflow-auto rounded-lg bg-gray-900 border border-gray-700 p-3 text-[10px] text-gray-400 whitespace-pre-wrap">
+              {logs.join("\n")}
+            </pre>
+          )}
+        </div>
+      )}
+      <button onClick={onRetry} className="text-xs bg-gray-800 hover:bg-gray-700 text-indigo-400 px-3 py-1.5 rounded border border-gray-700 transition">
+        Retry
+      </button>
     </div>
   );
 }
@@ -540,6 +631,7 @@ interface VideoJobOutputProps {
   status: JobStatus;
   url: string | null;
   error: string | null;
+  logs: string[];
   filename: string;
   onGenerate: () => void;
   onRetry: () => void;
@@ -566,19 +658,93 @@ function VideoJobOutput(props: VideoJobOutputProps) {
     );
   }
   if (props.status === "error") {
-    return <ErrorBlock message={props.error} onRetry={props.onRetry} />;
+    return <ErrorBlock message={props.error} logs={props.logs} onRetry={props.onRetry} />;
   }
   if (props.canGenerate) {
     return (
       <div className="space-y-2">
         <Placeholder label="Ready to generate" />
-        <button onClick={props.onGenerate} className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded transition">
+        <button onClick={props.onGenerate} className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded transition">
           {props.generateLabel}
         </button>
       </div>
     );
   }
   return <Placeholder label={props.disabledLabel} />;
+}
+
+function ShortsOutput({
+  status,
+  shorts,
+  error,
+  logs,
+  onRetry,
+  hasMedia,
+  artistName,
+}: {
+  status: JobStatus;
+  shorts: ShortItem[];
+  error: string | null;
+  logs: string[];
+  onRetry: () => void;
+  hasMedia: boolean;
+  artistName: string;
+}) {
+  if (status === "generating") {
+    return (
+      <div className="rounded-lg bg-gray-800 border border-gray-700 p-8 flex items-center justify-center">
+        <Spinner text="Rendering 3 shorts… this takes a moment" />
+      </div>
+    );
+  }
+  if (status === "error") {
+    return <ErrorBlock message={error} logs={logs} onRetry={onRetry} />;
+  }
+  if (status === "done" && shorts.length > 0) {
+    return (
+      <div className="space-y-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          {shorts.map((s) => (
+            <div key={s.index} className="space-y-2">
+              {s.status === "ok" && s.url ? (
+                <>
+                  <video src={s.url} controls className="rounded-lg border border-gray-700 w-full aspect-[9/16] object-cover" />
+                  <p className="text-xs text-gray-300 font-medium">“{s.hook}”</p>
+                  <DownloadBtn href={s.url} filename={`${artistName}-short-${s.index + 1}.mp4`} label="Download" />
+                </>
+              ) : (
+                <div className="rounded-lg bg-red-900/20 border border-red-800 p-3 aspect-[9/16] flex items-center justify-center">
+                  <span className="text-[10px] text-red-300 text-center">
+                    Short {s.index + 1} failed
+                    {s.detail ? `:\n${s.detail}` : ""}
+                  </span>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        {logs.length > 0 && (
+          <details className="text-xs text-gray-500">
+            <summary className="cursor-pointer hover:text-gray-400">Show logs</summary>
+            <pre className="mt-2 max-h-64 overflow-auto rounded-lg bg-gray-900 border border-gray-700 p-3 text-[10px] text-gray-400 whitespace-pre-wrap">
+              {logs.join("\n")}
+            </pre>
+          </details>
+        )}
+      </div>
+    );
+  }
+  if (hasMedia) {
+    return (
+      <div className="space-y-2">
+        <Placeholder label="3 vertical shorts ready to generate" />
+        <button onClick={onRetry} className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded transition">
+          Generate Shorts
+        </button>
+      </div>
+    );
+  }
+  return <Placeholder label="Upload artwork + audio to enable" />;
 }
 
 function CopyOptions({ data }: { data: { titles: string[]; shortDescription: string; fullDescription: string; hashtags: string; tags: string } }) {

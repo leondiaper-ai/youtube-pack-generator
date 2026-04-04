@@ -5,168 +5,212 @@ import { join } from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { randomUUID } from "crypto";
+import { tmpdir } from "os";
 
-const exec = promisify(execFile);
-const TMP_DIR = join(process.cwd(), "tmp");
+const execFileAsync = promisify(execFile);
+
+export const runtime = "nodejs";
+export const maxDuration = 300;
 
 /**
- * Visualiser presets — each controls zoom, pan, colour grading, and texture.
- * All implemented as FFmpeg filter chains.
+ * Visualiser generation route.
+ *
+ * Produces a 1920x1080 mp4 from a single artwork image plus an audio track.
+ * Supports 3 clearly distinct presets:
+ *
+ *   - clean-minimal  : slow cinematic zoom, restrained fade, elegant
+ *   - moody-drift    : slow push/pull, vignette, grain, gentle brightness breathing
+ *   - bold-pulse     : stronger zoom pulses, contrast lift, more energetic motion
+ *
+ * Every preset keeps the audio stream perfectly intact (copied) and is designed
+ * to feel label/artist usable rather than cheesy.
  */
-type VisPreset = "moody-drift" | "pulse" | "parallax";
 
-interface PresetConfig {
-  /** zoompan filter expression for z (zoom level per frame) */
-  zoom: string;
-  /** zoompan x expression (pan horizontal) */
-  panX: string;
-  /** zoompan y expression (pan vertical) */
-  panY: string;
-  /** Extra video filters applied after zoompan (colour grade, grain, vignette) */
-  postFilters: string;
+type Preset = "clean-minimal" | "moody-drift" | "bold-pulse";
+
+const PRESETS: Record<Preset, string> = {
+  // A. CLEAN MINIMAL
+  //   Gentle linear zoom (1.00 → 1.08) across the whole clip, held at full
+  //   brightness, soft fade in/out. No grain, no vignette — label-safe elegance.
+  "clean-minimal": [
+    // scale + crop to 1080p canvas, preserve aspect, center
+    "scale=2400:-2,crop=1920:1080",
+    // slow linear zoom across entire duration (d is injected per-call)
+    "zoompan=z='min(1.00+on/DURFR*0.08,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=DURFR:s=1920x1080:fps=30",
+    // cinematic fade in / fade out
+    "fade=t=in:st=0:d=1.2,fade=t=out:st=FADEOUT:d=1.2",
+    // very mild s-curve for film feel
+    "eq=contrast=1.04:saturation=1.02",
+    "format=yuv420p",
+  ].join(","),
+
+  // B. MOODY DRIFT
+  //   Slow push with subtle drift, soft vignette, film grain overlay,
+  //   brightness breathing tied to a slow sine to suggest audio energy.
+  "moody-drift": [
+    "scale=2600:-2,crop=1920:1080",
+    // push/pull feel: ease into 1.12 then gently settle to 1.06
+    "zoompan=z='1.00+0.12*sin(on/DURFR*PI)':x='iw/2-(iw/zoom/2)+20*sin(on/DURFR*PI*2)':y='ih/2-(ih/zoom/2)':d=DURFR:s=1920x1080:fps=30",
+    // soft vignette using radial darkening
+    "vignette=PI/5",
+    // film grain via noise
+    "noise=alls=8:allf=t+u",
+    // gentle brightness breathing (−4% → +4%)
+    "eq=contrast=1.08:saturation=0.95:brightness='0.04*sin(t*0.6)':gamma=1.02",
+    "fade=t=in:st=0:d=1.5,fade=t=out:st=FADEOUT:d=1.5",
+    "format=yuv420p",
+  ].join(","),
+
+  // C. BOLD PULSE
+  //   More energetic: zoom pulses on a 2-second cycle, punchier contrast,
+  //   sharper fade. Still restrained enough to feel premium.
+  "bold-pulse": [
+    "scale=2400:-2,crop=1920:1080",
+    // zoom pulses every 2 seconds (cycle via mod on frame index)
+    "zoompan=z='1.04+0.06*abs(sin(on/60*PI))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=DURFR:s=1920x1080:fps=30",
+    // contrast + saturation lift
+    "eq=contrast=1.18:saturation=1.12:brightness=0.02",
+    // subtle unsharp for extra punch
+    "unsharp=5:5:0.6:5:5:0.0",
+    "fade=t=in:st=0:d=0.8,fade=t=out:st=FADEOUT:d=1.0",
+    "format=yuv420p",
+  ].join(","),
+};
+
+function buildFilter(preset: Preset, durationSec: number): string {
+  const totalFrames = Math.max(30, Math.round(durationSec * 30));
+  const fadeOutStart = Math.max(0, durationSec - 1.5).toFixed(2);
+  return PRESETS[preset]
+    .replace(/DURFR/g, String(totalFrames))
+    .replace(/FADEOUT/g, fadeOutStart);
 }
 
-function getPresetConfig(preset: VisPreset, totalFrames: number): PresetConfig {
-  switch (preset) {
-    case "moody-drift":
-      return {
-        // Slow zoom in + gentle drift right and down
-        zoom: "min(zoom+0.00015,1.08)",
-        panX: `iw/2-(iw/zoom/2)+${Math.round(totalFrames * 0.02)}*on/${totalFrames}`,
-        panY: `ih/2-(ih/zoom/2)+${Math.round(totalFrames * 0.01)}*on/${totalFrames}`,
-        // Desaturate slightly, add vignette, warm tint, film grain
-        postFilters: [
-          "eq=saturation=0.75:contrast=1.1:brightness=-0.03",
-          "vignette=PI/4",
-          "colorbalance=rs=0.05:gs=0.0:bs=-0.05:rm=0.03:gm=0.0:bm=-0.03",
-          "noise=alls=6:allf=t",
-        ].join(","),
-      };
-
-    case "pulse":
-      return {
-        // Breathing zoom: oscillates between 1.0 and 1.06 using sine wave
-        zoom: `1.0+0.06*abs(sin(on/${Math.max(Math.round(totalFrames / 4), 1)}*PI))`,
-        panX: "iw/2-(iw/zoom/2)",
-        panY: "ih/2-(ih/zoom/2)",
-        // High contrast, slight bloom via unsharp, vibrant
-        postFilters: [
-          "eq=saturation=1.15:contrast=1.15:brightness=0.02",
-          "unsharp=3:3:1.5:3:3:0",
-          "noise=alls=3:allf=t",
-        ].join(","),
-      };
-
-    case "parallax":
-      return {
-        // Slow horizontal pan + gentle zoom for depth feel
-        zoom: "min(zoom+0.0001,1.05)",
-        panX: `iw/4+iw/2*on/${totalFrames}-(iw/zoom/2)`,
-        panY: "ih/2-(ih/zoom/2)",
-        // Cool tones, vignette, subtle blur edges, grain
-        postFilters: [
-          "eq=saturation=0.85:contrast=1.05",
-          "vignette=PI/3.5",
-          "colorbalance=rs=-0.03:gs=0.0:bs=0.06:rm=-0.02:gm=0.0:bm=0.04",
-          "noise=alls=4:allf=t",
-        ].join(","),
-      };
+async function getAudioDuration(audioPath: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      audioPath,
+    ]);
+    const d = parseFloat(stdout.trim());
+    return Number.isFinite(d) && d > 0 ? d : 30;
+  } catch {
+    return 30;
   }
 }
 
-/**
- * POST /api/visualiser
- * Form fields: artwork, audio, preset (moody-drift | pulse | parallax)
- * Returns mp4 binary.
- */
 export async function POST(req: NextRequest) {
-  const id = randomUUID().slice(0, 8);
-  const artworkPath = join(TMP_DIR, `${id}-artwork.png`);
-  const audioPath = join(TMP_DIR, `${id}-audio.mp3`);
-  const outputPath = join(TMP_DIR, `${id}-visualiser.mp4`);
+  const workId = randomUUID();
+  const workDir = join(tmpdir(), "ypg-visualiser", workId);
+  const logs: string[] = [];
+  const log = (m: string) => logs.push(`[visualiser] ${m}`);
 
   try {
-    if (!existsSync(TMP_DIR)) await mkdir(TMP_DIR, { recursive: true });
+    await mkdir(workDir, { recursive: true });
+    log(`work dir: ${workDir}`);
 
-    const formData = await req.formData();
-    const artwork = formData.get("artwork") as File | null;
-    const audio = formData.get("audio") as File | null;
-    const preset = (formData.get("preset") as VisPreset) || "moody-drift";
+    const form = await req.formData();
+    const artwork = form.get("artwork");
+    const audio = form.get("audio");
+    const presetRaw = (form.get("preset") as string) || "clean-minimal";
+    const preset: Preset = (["clean-minimal", "moody-drift", "bold-pulse"] as Preset[]).includes(
+      presetRaw as Preset
+    )
+      ? (presetRaw as Preset)
+      : "clean-minimal";
 
-    if (!artwork || !audio) {
+    if (!(artwork instanceof File) || !(audio instanceof File)) {
       return NextResponse.json(
-        { error: "Both artwork and audio files are required." },
+        { error: "Missing artwork or audio file", logs },
         { status: 400 }
       );
     }
 
+    const artworkPath = join(workDir, "artwork.png");
+    const audioPath = join(workDir, "audio.mp3");
+    const outputPath = join(workDir, "visualiser.mp4");
+
+    log("writing inputs to disk");
     await writeFile(artworkPath, Buffer.from(await artwork.arrayBuffer()));
     await writeFile(audioPath, Buffer.from(await audio.arrayBuffer()));
 
-    // Probe audio duration
-    const { stdout: probeOut } = await exec("ffprobe", [
-      "-v", "quiet",
-      "-show_entries", "format=duration",
-      "-of", "csv=p=0",
+    const duration = await getAudioDuration(audioPath);
+    log(`detected audio duration: ${duration.toFixed(2)}s`);
+
+    const videoFilter = buildFilter(preset, duration);
+    log(`preset: ${preset}`);
+
+    const args = [
+      "-y",
+      "-loop",
+      "1",
+      "-i",
+      artworkPath,
+      "-i",
       audioPath,
-    ]);
-    const duration = parseFloat(probeOut.trim()) || 30;
-    const fps = 24;
-    const totalFrames = Math.ceil(duration * fps);
+      "-filter_complex",
+      `[0:v]${videoFilter}[v]`,
+      "-map",
+      "[v]",
+      "-map",
+      "1:a",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-pix_fmt",
+      "yuv420p",
+      "-r",
+      "30",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-shortest",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ];
 
-    const cfg = getPresetConfig(preset, totalFrames);
+    log("running ffmpeg");
+    await execFileAsync("ffmpeg", args, { maxBuffer: 1024 * 1024 * 64 });
+    log("ffmpeg finished");
 
-    // Build filter chain
-    const filterComplex = [
-      `[0:v]scale=1920:1080,`,
-      `zoompan=z='${cfg.zoom}'`,
-      `:x='${cfg.panX}'`,
-      `:y='${cfg.panY}'`,
-      `:d=${totalFrames}:s=1920x1080:fps=${fps},`,
-      cfg.postFilters,
-      `[v]`,
-    ].join("");
+    if (!existsSync(outputPath)) {
+      throw new Error("ffmpeg reported success but output file is missing");
+    }
 
-    await exec(
-      "ffmpeg",
-      [
-        "-y",
-        "-loop", "1",
-        "-i", artworkPath,
-        "-i", audioPath,
-        "-filter_complex", filterComplex,
-        "-map", "[v]",
-        "-map", "1:a",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-shortest",
-        "-movflags", "+faststart",
-        "-t", String(duration),
-        outputPath,
-      ],
-      { timeout: 600_000 }
-    );
+    const buf = await readFile(outputPath);
+    log(`output size: ${(buf.length / 1024 / 1024).toFixed(2)} MB`);
 
-    const videoBuffer = await readFile(outputPath);
-    cleanup(artworkPath, audioPath, outputPath);
+    // best-effort cleanup (don't block response)
+    unlink(artworkPath).catch(() => {});
+    unlink(audioPath).catch(() => {});
+    unlink(outputPath).catch(() => {});
 
-    return new NextResponse(videoBuffer, {
+    return new NextResponse(buf, {
       headers: {
         "Content-Type": "video/mp4",
-        "Content-Disposition": `attachment; filename="visualiser.mp4"`,
+        "Content-Disposition": `attachment; filename="visualiser-${preset}.mp4"`,
+        "X-YPG-Logs": encodeURIComponent(logs.join(" | ")),
       },
     });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    console.error("Visualiser generation failed:", message);
-    cleanup(artworkPath, audioPath, outputPath);
-    return NextResponse.json({ error: `Generation failed: ${message}` }, { status: 500 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log(`ERROR: ${message}`);
+    return NextResponse.json(
+      {
+        error: "Visualiser generation failed",
+        detail: message,
+        logs,
+      },
+      { status: 500 }
+    );
   }
-}
-
-function cleanup(...paths: string[]) {
-  for (const p of paths) unlink(p).catch(() => {});
 }
